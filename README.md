@@ -17,7 +17,7 @@ It contains code examples and exercises similar to Rustlings, but online.
 
 ### Installing Rust
 
-Before installing Rustlings, you need to have _Rust installed_.
+Before installing Rustlings, you need to have the **latest version of Rust** installed.
 Visit [www.rust-lang.org/tools/install](https://www.rust-lang.org/tools/install) for further instructions on installing Rust.
 This will also install _Cargo_, Rust's package/project manager.
 
@@ -87,8 +87,6 @@ But any editor that supports [rust-analyzer](https://rust-analyzer.github.io/) s
 While working with Rustlings, please use a modern terminal for the best user experience.
 The default terminal on Linux and Mac should be sufficient.
 On Windows, we recommend the [Windows Terminal](https://aka.ms/terminal).
-
-If you use VS Code, the builtin terminal should also be fine.
 
 ## Doing exercises
 

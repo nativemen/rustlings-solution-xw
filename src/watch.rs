@@ -1,4 +1,4 @@
-use anyhow::{Error, Result};
+use anyhow::{Context, Error, Result};
 use notify_debouncer_mini::{
     new_debouncer,
     notify::{self, RecursiveMode},
@@ -11,7 +11,10 @@ use std::{
     time::Duration,
 };
 
-use crate::app_state::{AppState, ExercisesProgress};
+use crate::{
+    app_state::{AppState, ExercisesProgress},
+    list,
+};
 
 use self::{
     notify_event::NotifyEventHandler,
@@ -26,22 +29,21 @@ mod terminal_event;
 enum WatchEvent {
     Input(InputEvent),
     FileChange { exercise_ind: usize },
-    TerminalResize,
+    TerminalResize { width: u16 },
     NotifyErr(notify::Error),
     TerminalEventErr(io::Error),
 }
 
 /// Returned by the watch mode to indicate what to do afterwards.
 #[must_use]
-pub enum WatchExit {
+enum WatchExit {
     /// Exit the program.
     Shutdown,
     /// Enter the list mode and restart the watch mode afterwards.
     List,
 }
 
-/// `notify_exercise_names` as None activates the manual run mode.
-pub fn watch(
+fn run_watch(
     app_state: &mut AppState,
     notify_exercise_names: Option<&'static [&'static [u8]]>,
 ) -> Result<WatchExit> {
@@ -70,41 +72,36 @@ pub fn watch(
         None
     };
 
-    let mut watch_state = WatchState::new(app_state, manual_run);
+    let mut watch_state = WatchState::build(app_state, manual_run)?;
 
-    watch_state.run_current_exercise()?;
+    let mut stdout = io::stdout().lock();
+    watch_state.run_current_exercise(&mut stdout)?;
 
-    thread::spawn(move || terminal_event_handler(tx, manual_run));
+    thread::Builder::new()
+        .spawn(move || terminal_event_handler(tx, manual_run))
+        .context("Failed to spawn a thread to handle terminal events")?;
 
     while let Ok(event) = rx.recv() {
         match event {
-            WatchEvent::Input(InputEvent::Next) => match watch_state.next_exercise()? {
+            WatchEvent::Input(InputEvent::Next) => match watch_state.next_exercise(&mut stdout)? {
                 ExercisesProgress::AllDone => break,
-                ExercisesProgress::CurrentPending => watch_state.render()?,
-                ExercisesProgress::NewPending => watch_state.run_current_exercise()?,
+                ExercisesProgress::NewPending => watch_state.run_current_exercise(&mut stdout)?,
+                ExercisesProgress::CurrentPending => (),
             },
-            WatchEvent::Input(InputEvent::Hint) => {
-                watch_state.show_hint()?;
-            }
-            WatchEvent::Input(InputEvent::List) => {
-                return Ok(WatchExit::List);
-            }
+            WatchEvent::Input(InputEvent::Hint) => watch_state.show_hint(&mut stdout)?,
+            WatchEvent::Input(InputEvent::List) => return Ok(WatchExit::List),
             WatchEvent::Input(InputEvent::Quit) => {
-                watch_state.into_writer().write_all(QUIT_MSG)?;
+                stdout.write_all(QUIT_MSG)?;
                 break;
             }
-            WatchEvent::Input(InputEvent::Run) => watch_state.run_current_exercise()?,
-            WatchEvent::Input(InputEvent::Unrecognized) => watch_state.render()?,
+            WatchEvent::Input(InputEvent::Run) => watch_state.run_current_exercise(&mut stdout)?,
             WatchEvent::FileChange { exercise_ind } => {
-                watch_state.handle_file_change(exercise_ind)?;
+                watch_state.handle_file_change(exercise_ind, &mut stdout)?;
             }
-            WatchEvent::TerminalResize => {
-                watch_state.render()?;
+            WatchEvent::TerminalResize { width } => {
+                watch_state.update_term_width(width, &mut stdout)?;
             }
-            WatchEvent::NotifyErr(e) => {
-                watch_state.into_writer().write_all(NOTIFY_ERR.as_bytes())?;
-                return Err(Error::from(e));
-            }
+            WatchEvent::NotifyErr(e) => return Err(Error::from(e).context(NOTIFY_ERR)),
             WatchEvent::TerminalEventErr(e) => {
                 return Err(Error::from(e).context("Terminal event listener failed"));
             }
@@ -112,6 +109,48 @@ pub fn watch(
     }
 
     Ok(WatchExit::Shutdown)
+}
+
+fn watch_list_loop(
+    app_state: &mut AppState,
+    notify_exercise_names: Option<&'static [&'static [u8]]>,
+) -> Result<()> {
+    loop {
+        match run_watch(app_state, notify_exercise_names)? {
+            WatchExit::Shutdown => break Ok(()),
+            // It is much easier to exit the watch mode, launch the list mode and then restart
+            // the watch mode instead of trying to pause the watch threads and correct the
+            // watch state.
+            WatchExit::List => list::list(app_state)?,
+        }
+    }
+}
+
+/// `notify_exercise_names` as None activates the manual run mode.
+pub fn watch(
+    app_state: &mut AppState,
+    notify_exercise_names: Option<&'static [&'static [u8]]>,
+) -> Result<()> {
+    #[cfg(not(windows))]
+    {
+        let stdin_fd = rustix::stdio::stdin();
+        let mut termios = rustix::termios::tcgetattr(stdin_fd)?;
+        let original_local_modes = termios.local_modes;
+        // Disable stdin line buffering and hide input.
+        termios.local_modes -=
+            rustix::termios::LocalModes::ICANON | rustix::termios::LocalModes::ECHO;
+        rustix::termios::tcsetattr(stdin_fd, rustix::termios::OptionalActions::Now, &termios)?;
+
+        let res = watch_list_loop(app_state, notify_exercise_names);
+
+        termios.local_modes = original_local_modes;
+        rustix::termios::tcsetattr(stdin_fd, rustix::termios::OptionalActions::Now, &termios)?;
+
+        res
+    }
+
+    #[cfg(windows)]
+    watch_list_loop(app_state, notify_exercise_names)
 }
 
 const QUIT_MSG: &[u8] = b"

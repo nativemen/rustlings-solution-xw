@@ -1,4 +1,4 @@
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use std::sync::mpsc::Sender;
 
 use super::WatchEvent;
@@ -9,13 +9,9 @@ pub enum InputEvent {
     Hint,
     List,
     Quit,
-    Unrecognized,
 }
 
 pub fn terminal_event_handler(tx: Sender<WatchEvent>, manual_run: bool) {
-    // Only send `Unrecognized` on ENTER if the last input wasn't valid.
-    let mut last_input_valid = false;
-
     let last_input_event = loop {
         let terminal_event = match event::read() {
             Ok(v) => v,
@@ -34,51 +30,25 @@ pub fn terminal_event_handler(tx: Sender<WatchEvent>, manual_run: bool) {
                     KeyEventKind::Press => (),
                 }
 
-                if key.modifiers != KeyModifiers::NONE {
-                    last_input_valid = false;
-                    continue;
-                }
-
                 let input_event = match key.code {
-                    KeyCode::Enter => {
-                        if last_input_valid {
-                            continue;
-                        }
-
-                        InputEvent::Unrecognized
-                    }
-                    KeyCode::Char(c) => {
-                        let input_event = match c {
-                            'n' => InputEvent::Next,
-                            'h' => InputEvent::Hint,
-                            'l' => break InputEvent::List,
-                            'q' => break InputEvent::Quit,
-                            'r' if manual_run => InputEvent::Run,
-                            _ => {
-                                last_input_valid = false;
-                                continue;
-                            }
-                        };
-
-                        last_input_valid = true;
-                        input_event
-                    }
-                    _ => {
-                        last_input_valid = false;
-                        continue;
-                    }
+                    KeyCode::Char('n') => InputEvent::Next,
+                    KeyCode::Char('h') => InputEvent::Hint,
+                    KeyCode::Char('l') => break InputEvent::List,
+                    KeyCode::Char('q') => break InputEvent::Quit,
+                    KeyCode::Char('r') if manual_run => InputEvent::Run,
+                    _ => continue,
                 };
 
                 if tx.send(WatchEvent::Input(input_event)).is_err() {
                     return;
                 }
             }
-            Event::Resize(_, _) => {
-                if tx.send(WatchEvent::TerminalResize).is_err() {
+            Event::Resize(width, _) => {
+                if tx.send(WatchEvent::TerminalResize { width }).is_err() {
                     return;
                 }
             }
-            Event::FocusGained | Event::FocusLost | Event::Mouse(_) | Event::Paste(_) => continue,
+            Event::FocusGained | Event::FocusLost | Event::Mouse(_) => continue,
         }
     };
 

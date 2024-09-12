@@ -1,16 +1,17 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::{
-    style::{style, Stylize},
-    terminal,
+    style::{
+        Attribute, Attributes, Color, ResetColor, SetAttribute, SetAttributes, SetForegroundColor,
+    },
+    terminal, QueueableCommand,
 };
 use std::io::{self, StdoutLock, Write};
 
 use crate::{
     app_state::{AppState, ExercisesProgress},
     clear_terminal,
-    exercise::{RunnableExercise, OUTPUT_CAPACITY},
-    progress_bar::progress_bar,
-    terminal_link::TerminalFileLink,
+    exercise::{solution_link_line, RunnableExercise, OUTPUT_CAPACITY},
+    term::progress_bar,
 };
 
 #[derive(PartialEq, Eq)]
@@ -21,40 +22,44 @@ enum DoneStatus {
 }
 
 pub struct WatchState<'a> {
-    writer: StdoutLock<'a>,
     app_state: &'a mut AppState,
     output: Vec<u8>,
     show_hint: bool,
     done_status: DoneStatus,
     manual_run: bool,
+    term_width: u16,
 }
 
 impl<'a> WatchState<'a> {
-    pub fn new(app_state: &'a mut AppState, manual_run: bool) -> Self {
-        let writer = io::stdout().lock();
+    pub fn build(app_state: &'a mut AppState, manual_run: bool) -> Result<Self> {
+        let term_width = terminal::size()
+            .context("Failed to get the terminal size")?
+            .0;
 
-        Self {
-            writer,
+        Ok(Self {
             app_state,
             output: Vec::with_capacity(OUTPUT_CAPACITY),
             show_hint: false,
             done_status: DoneStatus::Pending,
             manual_run,
-        }
+            term_width,
+        })
     }
 
-    #[inline]
-    pub fn into_writer(self) -> StdoutLock<'a> {
-        self.writer
-    }
-
-    pub fn run_current_exercise(&mut self) -> Result<()> {
+    pub fn run_current_exercise(&mut self, stdout: &mut StdoutLock) -> Result<()> {
         self.show_hint = false;
+
+        writeln!(
+            stdout,
+            "\nChecking the exercise `{}`. Please wait…",
+            self.app_state.current_exercise().name,
+        )?;
 
         let success = self
             .app_state
             .current_exercise()
-            .run_exercise(&mut self.output, self.app_state.target_dir())?;
+            .run_exercise(Some(&mut self.output), self.app_state.cmd_runner())?;
+        self.output.push(b'\n');
         if success {
             self.done_status =
                 if let Some(solution_path) = self.app_state.current_solution_path()? {
@@ -69,10 +74,15 @@ impl<'a> WatchState<'a> {
             self.done_status = DoneStatus::Pending;
         }
 
-        self.render()
+        self.render(stdout)?;
+        Ok(())
     }
 
-    pub fn handle_file_change(&mut self, exercise_ind: usize) -> Result<()> {
+    pub fn handle_file_change(
+        &mut self,
+        exercise_ind: usize,
+        stdout: &mut StdoutLock,
+    ) -> Result<()> {
         // Don't skip exercises on file changes to avoid confusion from missing exercises.
         // Skipping exercises must be explicit in the interactive list.
         // But going back to an earlier exercise on file change is fine.
@@ -81,94 +91,129 @@ impl<'a> WatchState<'a> {
         }
 
         self.app_state.set_current_exercise_ind(exercise_ind)?;
-        self.run_current_exercise()
+        self.run_current_exercise(stdout)
     }
 
     /// Move on to the next exercise if the current one is done.
-    pub fn next_exercise(&mut self) -> Result<ExercisesProgress> {
+    pub fn next_exercise(&mut self, stdout: &mut StdoutLock) -> Result<ExercisesProgress> {
         if self.done_status == DoneStatus::Pending {
             return Ok(ExercisesProgress::CurrentPending);
         }
 
-        self.app_state.done_current_exercise(&mut self.writer)
+        self.app_state.done_current_exercise(stdout)
     }
 
-    fn show_prompt(&mut self) -> io::Result<()> {
-        self.writer.write_all(b"\n")?;
-
+    fn show_prompt(&self, stdout: &mut StdoutLock) -> io::Result<()> {
         if self.manual_run {
-            write!(self.writer, "{}:run / ", 'r'.bold())?;
+            stdout.queue(SetAttribute(Attribute::Bold))?;
+            stdout.write_all(b"r")?;
+            stdout.queue(ResetColor)?;
+            stdout.write_all(b":run / ")?;
         }
 
         if self.done_status != DoneStatus::Pending {
-            write!(self.writer, "{}:{} / ", 'n'.bold(), "next".underlined())?;
+            stdout.queue(SetAttribute(Attribute::Bold))?;
+            stdout.write_all(b"n")?;
+            stdout.queue(ResetColor)?;
+            stdout.write_all(b":")?;
+            stdout.queue(SetAttribute(Attribute::Underlined))?;
+            stdout.write_all(b"next")?;
+            stdout.queue(ResetColor)?;
+            stdout.write_all(b" / ")?;
         }
 
         if !self.show_hint {
-            write!(self.writer, "{}:hint / ", 'h'.bold())?;
+            stdout.queue(SetAttribute(Attribute::Bold))?;
+            stdout.write_all(b"h")?;
+            stdout.queue(ResetColor)?;
+            stdout.write_all(b":hint / ")?;
         }
 
-        write!(self.writer, "{}:list / {}:quit ? ", 'l'.bold(), 'q'.bold())?;
+        stdout.queue(SetAttribute(Attribute::Bold))?;
+        stdout.write_all(b"l")?;
+        stdout.queue(ResetColor)?;
+        stdout.write_all(b":list / ")?;
 
-        self.writer.flush()
+        stdout.queue(SetAttribute(Attribute::Bold))?;
+        stdout.write_all(b"q")?;
+        stdout.queue(ResetColor)?;
+        stdout.write_all(b":quit ? ")?;
+
+        stdout.flush()
     }
 
-    pub fn render(&mut self) -> Result<()> {
+    pub fn render(&self, stdout: &mut StdoutLock) -> io::Result<()> {
         // Prevent having the first line shifted if clearing wasn't successful.
-        self.writer.write_all(b"\n")?;
+        stdout.write_all(b"\n")?;
+        clear_terminal(stdout)?;
 
-        clear_terminal(&mut self.writer)?;
-
-        self.writer.write_all(&self.output)?;
-        self.writer.write_all(b"\n")?;
+        stdout.write_all(&self.output)?;
 
         if self.show_hint {
-            writeln!(
-                self.writer,
-                "{}\n{}\n",
-                "Hint".bold().cyan().underlined(),
-                self.app_state.current_exercise().hint,
-            )?;
+            stdout
+                .queue(SetAttributes(
+                    Attributes::from(Attribute::Bold).with(Attribute::Underlined),
+                ))?
+                .queue(SetForegroundColor(Color::Cyan))?;
+            stdout.write_all(b"Hint")?;
+            stdout.queue(ResetColor)?;
+            stdout.write_all(b"\n")?;
+
+            stdout.write_all(self.app_state.current_exercise().hint.as_bytes())?;
+            stdout.write_all(b"\n\n")?;
         }
 
         if self.done_status != DoneStatus::Pending {
-            writeln!(
-                self.writer,
-                "{}\n",
-                "Exercise done ✓
-When you are done experimenting, enter `n` to move on to the next exercise 🦀"
-                    .bold()
-                    .green(),
+            stdout
+                .queue(SetAttribute(Attribute::Bold))?
+                .queue(SetForegroundColor(Color::Green))?;
+            stdout.write_all("Exercise done ✓".as_bytes())?;
+            stdout.queue(ResetColor)?;
+            stdout.write_all(b"\n")?;
+
+            if let DoneStatus::DoneWithSolution(solution_path) = &self.done_status {
+                solution_link_line(stdout, solution_path)?;
+            }
+
+            stdout.write_all(
+                "When done experimenting, enter `n` to move on to the next exercise 🦀\n\n"
+                    .as_bytes(),
             )?;
         }
 
-        if let DoneStatus::DoneWithSolution(solution_path) = &self.done_status {
-            writeln!(
-                self.writer,
-                "A solution file can be found at {}\n",
-                style(TerminalFileLink(solution_path)).underlined().green(),
-            )?;
-        }
-
-        let line_width = terminal::size()?.0;
-        let progress_bar = progress_bar(
+        progress_bar(
+            stdout,
             self.app_state.n_done(),
             self.app_state.exercises().len() as u16,
-            line_width,
-        )?;
-        writeln!(
-            self.writer,
-            "{progress_bar}Current exercise: {}",
-            self.app_state.current_exercise().terminal_link(),
+            self.term_width,
         )?;
 
-        self.show_prompt()?;
+        stdout.write_all(b"\nCurrent exercise: ")?;
+        self.app_state
+            .current_exercise()
+            .terminal_file_link(stdout)?;
+        stdout.write_all(b"\n\n")?;
+
+        self.show_prompt(stdout)?;
 
         Ok(())
     }
 
-    pub fn show_hint(&mut self) -> Result<()> {
-        self.show_hint = true;
-        self.render()
+    pub fn show_hint(&mut self, stdout: &mut StdoutLock) -> io::Result<()> {
+        if !self.show_hint {
+            self.show_hint = true;
+            self.render(stdout)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn update_term_width(&mut self, width: u16, stdout: &mut StdoutLock) -> io::Result<()> {
+        if self.term_width != width {
+            self.term_width = width;
+            self.render(stdout)?;
+        }
+
+        Ok(())
     }
 }

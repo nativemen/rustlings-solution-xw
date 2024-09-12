@@ -1,32 +1,33 @@
 use anyhow::{bail, Context, Result};
-use crossterm::style::Stylize;
-use serde::Deserialize;
 use std::{
-    fs::{self, File},
-    io::{Read, StdoutLock, Write},
-    path::{Path, PathBuf},
+    env,
+    fs::{File, OpenOptions},
+    io::{self, Read, Seek, StdoutLock, Write},
+    path::{Path, MAIN_SEPARATOR_STR},
     process::{Command, Stdio},
+    thread,
 };
 
 use crate::{
     clear_terminal,
+    cmd::CmdRunner,
+    collections::hash_set_with_capacity,
     embedded::EMBEDDED_FILES,
-    exercise::{Exercise, RunnableExercise, OUTPUT_CAPACITY},
+    exercise::{Exercise, RunnableExercise},
     info_file::ExerciseInfo,
-    DEBUG_PROFILE,
+    term,
 };
 
 const STATE_FILE_NAME: &str = ".rustlings-state.txt";
-const BAD_INDEX_ERR: &str = "The current exercise index is higher than the number of exercises";
 
 #[must_use]
 pub enum ExercisesProgress {
     // All exercises are done.
     AllDone,
-    // The current exercise failed and is still pending.
-    CurrentPending,
     // A new exercise is now pending.
     NewPending,
+    // The current exercise is still pending.
+    CurrentPending,
 }
 
 pub enum StateFileStatus {
@@ -34,29 +35,10 @@ pub enum StateFileStatus {
     NotRead,
 }
 
-// Parses parts of the output of `cargo metadata`.
-#[derive(Deserialize)]
-struct CargoMetadata {
-    target_directory: PathBuf,
-}
-
-pub fn parse_target_dir() -> Result<PathBuf> {
-    // Get the target directory from Cargo.
-    let metadata_output = Command::new("cargo")
-        .arg("metadata")
-        .arg("-q")
-        .arg("--format-version")
-        .arg("1")
-        .arg("--no-deps")
-        .stdin(Stdio::null())
-        .stderr(Stdio::inherit())
-        .output()
-        .context(CARGO_METADATA_ERR)?
-        .stdout;
-
-    serde_json::de::from_slice::<CargoMetadata>(&metadata_output)
-        .context("Failed to read the field `target_directory` from the `cargo metadata` output")
-        .map(|metadata| metadata.target_directory)
+enum AllExercisesCheck {
+    Pending(usize),
+    AllDone,
+    CheckedUntil(usize),
 }
 
 pub struct AppState {
@@ -65,67 +47,33 @@ pub struct AppState {
     // Caches the number of done exercises to avoid iterating over all exercises every time.
     n_done: u16,
     final_message: String,
+    state_file: File,
     // Preallocated buffer for reading and writing the state file.
     file_buf: Vec<u8>,
     official_exercises: bool,
-    // Cargo's target directory.
-    target_dir: PathBuf,
+    cmd_runner: CmdRunner,
+    // Running in VS Code.
+    vs_code: bool,
 }
 
 impl AppState {
-    // Update the app state from the state file.
-    fn update_from_file(&mut self) -> StateFileStatus {
-        self.file_buf.clear();
-        self.n_done = 0;
-
-        if File::open(STATE_FILE_NAME)
-            .and_then(|mut file| file.read_to_end(&mut self.file_buf))
-            .is_err()
-        {
-            return StateFileStatus::NotRead;
-        }
-
-        // See `Self::write` for more information about the file format.
-        let mut lines = self.file_buf.split(|c| *c == b'\n').skip(2);
-
-        let Some(current_exercise_name) = lines.next() else {
-            return StateFileStatus::NotRead;
-        };
-
-        if current_exercise_name.is_empty() || lines.next().is_none() {
-            return StateFileStatus::NotRead;
-        }
-
-        let mut done_exercises = hashbrown::HashSet::with_capacity(self.exercises.len());
-
-        for done_exerise_name in lines {
-            if done_exerise_name.is_empty() {
-                break;
-            }
-            done_exercises.insert(done_exerise_name);
-        }
-
-        for (ind, exercise) in self.exercises.iter_mut().enumerate() {
-            if done_exercises.contains(exercise.name.as_bytes()) {
-                exercise.done = true;
-                self.n_done += 1;
-            }
-
-            if exercise.name.as_bytes() == current_exercise_name {
-                self.current_exercise_ind = ind;
-            }
-        }
-
-        StateFileStatus::Read
-    }
-
     pub fn new(
         exercise_infos: Vec<ExerciseInfo>,
         final_message: String,
     ) -> Result<(Self, StateFileStatus)> {
-        let target_dir = parse_target_dir()?;
+        let cmd_runner = CmdRunner::build()?;
+        let mut state_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(STATE_FILE_NAME)
+            .with_context(|| {
+                format!("Failed to open or create the state file {STATE_FILE_NAME}")
+            })?;
 
-        let exercises = exercise_infos
+        let dir_canonical_path = term::canonicalize("exercises");
+        let mut exercises = exercise_infos
             .into_iter()
             .map(|exercise_info| {
                 // Leaking to be able to borrow in the watch mode `Table`.
@@ -134,33 +82,99 @@ impl AppState {
                 let path = exercise_info.path().leak();
                 let name = exercise_info.name.leak();
                 let dir = exercise_info.dir.map(|dir| &*dir.leak());
+                let hint = exercise_info.hint.leak().trim_ascii();
 
-                let hint = exercise_info.hint.trim().to_owned();
+                let canonical_path = dir_canonical_path.as_deref().map(|dir_canonical_path| {
+                    let mut canonical_path;
+                    if let Some(dir) = dir {
+                        canonical_path = String::with_capacity(
+                            2 + dir_canonical_path.len() + dir.len() + name.len(),
+                        );
+                        canonical_path.push_str(dir_canonical_path);
+                        canonical_path.push_str(MAIN_SEPARATOR_STR);
+                        canonical_path.push_str(dir);
+                    } else {
+                        canonical_path =
+                            String::with_capacity(1 + dir_canonical_path.len() + name.len());
+                        canonical_path.push_str(dir_canonical_path);
+                    }
+
+                    canonical_path.push_str(MAIN_SEPARATOR_STR);
+                    canonical_path.push_str(name);
+                    canonical_path.push_str(".rs");
+                    canonical_path
+                });
 
                 Exercise {
                     dir,
                     name,
                     path,
+                    canonical_path,
                     test: exercise_info.test,
                     strict_clippy: exercise_info.strict_clippy,
                     hint,
-                    // Updated in `Self::update_from_file`.
+                    // Updated below.
                     done: false,
                 }
             })
             .collect::<Vec<_>>();
 
-        let mut slf = Self {
-            current_exercise_ind: 0,
-            exercises,
-            n_done: 0,
-            final_message,
-            file_buf: Vec::with_capacity(2048),
-            official_exercises: !Path::new("info.toml").exists(),
-            target_dir,
+        let mut current_exercise_ind = 0;
+        let mut n_done = 0;
+        let mut file_buf = Vec::with_capacity(2048);
+        let state_file_status = 'block: {
+            if state_file.read_to_end(&mut file_buf).is_err() {
+                break 'block StateFileStatus::NotRead;
+            }
+
+            // See `Self::write` for more information about the file format.
+            let mut lines = file_buf.split(|c| *c == b'\n').skip(2);
+
+            let Some(current_exercise_name) = lines.next() else {
+                break 'block StateFileStatus::NotRead;
+            };
+
+            if current_exercise_name.is_empty() || lines.next().is_none() {
+                break 'block StateFileStatus::NotRead;
+            }
+
+            let mut done_exercises = hash_set_with_capacity(exercises.len());
+
+            for done_exerise_name in lines {
+                if done_exerise_name.is_empty() {
+                    break;
+                }
+                done_exercises.insert(done_exerise_name);
+            }
+
+            for (ind, exercise) in exercises.iter_mut().enumerate() {
+                if done_exercises.contains(exercise.name.as_bytes()) {
+                    exercise.done = true;
+                    n_done += 1;
+                }
+
+                if exercise.name.as_bytes() == current_exercise_name {
+                    current_exercise_ind = ind;
+                }
+            }
+
+            StateFileStatus::Read
         };
 
-        let state_file_status = slf.update_from_file();
+        file_buf.clear();
+        file_buf.extend_from_slice(STATE_FILE_HEADER);
+
+        let slf = Self {
+            current_exercise_ind,
+            exercises,
+            n_done,
+            final_message,
+            state_file,
+            file_buf,
+            official_exercises: !Path::new("info.toml").exists(),
+            cmd_runner,
+            vs_code: env::var_os("TERM_PROGRAM").is_some_and(|v| v == "vscode"),
+        };
 
         Ok((slf, state_file_status))
     }
@@ -186,8 +200,13 @@ impl AppState {
     }
 
     #[inline]
-    pub fn target_dir(&self) -> &Path {
-        &self.target_dir
+    pub fn cmd_runner(&self) -> &CmdRunner {
+        &self.cmd_runner
+    }
+
+    #[inline]
+    pub fn vs_code(&self) -> bool {
+        self.vs_code
     }
 
     // Write the state file.
@@ -199,10 +218,8 @@ impl AppState {
     // - The fourth line is an empty line.
     // - All remaining lines are the names of done exercises.
     fn write(&mut self) -> Result<()> {
-        self.file_buf.clear();
+        self.file_buf.truncate(STATE_FILE_HEADER.len());
 
-        self.file_buf
-            .extend_from_slice(b"DON'T EDIT THIS FILE!\n\n");
         self.file_buf
             .extend_from_slice(self.current_exercise().name.as_bytes());
         self.file_buf.push(b'\n');
@@ -214,7 +231,14 @@ impl AppState {
             }
         }
 
-        fs::write(STATE_FILE_NAME, &self.file_buf)
+        self.state_file
+            .rewind()
+            .with_context(|| format!("Failed to rewind the state file {STATE_FILE_NAME}"))?;
+        self.state_file
+            .set_len(0)
+            .with_context(|| format!("Failed to truncate the state file {STATE_FILE_NAME}"))?;
+        self.state_file
+            .write_all(&self.file_buf)
             .with_context(|| format!("Failed to write the state file {STATE_FILE_NAME}"))?;
 
         Ok(())
@@ -298,6 +322,7 @@ impl AppState {
         Ok(exercise.path)
     }
 
+    // Reset the exercise by index and return its name.
     pub fn reset_exercise_by_ind(&mut self, exercise_ind: usize) -> Result<&'static str> {
         if exercise_ind >= self.exercises.len() {
             bail!(BAD_INDEX_ERR);
@@ -307,36 +332,33 @@ impl AppState {
         let exercise = &self.exercises[exercise_ind];
         self.reset(exercise_ind, exercise.path)?;
 
-        Ok(exercise.path)
+        Ok(exercise.name)
     }
 
     // Return the index of the next pending exercise or `None` if all exercises are done.
     fn next_pending_exercise_ind(&self) -> Option<usize> {
-        if self.current_exercise_ind == self.exercises.len() - 1 {
-            // The last exercise is done.
-            // Search for exercises not done from the start.
-            return self.exercises[..self.current_exercise_ind]
-                .iter()
-                .position(|exercise| !exercise.done);
-        }
-
-        // The done exercise isn't the last one.
-        // Search for a pending exercise after the current one and then from the start.
-        match self.exercises[self.current_exercise_ind + 1..]
-            .iter()
-            .position(|exercise| !exercise.done)
-        {
-            Some(ind) => Some(self.current_exercise_ind + 1 + ind),
-            None => self.exercises[..self.current_exercise_ind]
-                .iter()
-                .position(|exercise| !exercise.done),
-        }
+        let next_ind = self.current_exercise_ind + 1;
+        self.exercises
+            // If the exercise done isn't the last, search for pending exercises after it.
+            .get(next_ind..)
+            .and_then(|later_exercises| {
+                later_exercises
+                    .iter()
+                    .position(|exercise| !exercise.done)
+                    .map(|ind| next_ind + ind)
+            })
+            // Search from the start.
+            .or_else(|| {
+                self.exercises[..self.current_exercise_ind]
+                    .iter()
+                    .position(|exercise| !exercise.done)
+            })
     }
 
-    /// Official exercises: Dump the solution file form the binary and return its path.
+    /// Official exercises: Dump the solution file from the binary and return its path.
     /// Third-party exercises: Check if a solution file exists and return its path in that case.
     pub fn current_solution_path(&self) -> Result<Option<String>> {
-        if DEBUG_PROFILE {
+        if cfg!(debug_assertions) {
             return Ok(None);
         }
 
@@ -347,24 +369,79 @@ impl AppState {
                 .write_solution_to_disk(self.current_exercise_ind, current_exercise.name)
                 .map(Some)
         } else {
-            let solution_path = if let Some(dir) = current_exercise.dir {
-                format!("solutions/{dir}/{}.rs", current_exercise.name)
-            } else {
-                format!("solutions/{}.rs", current_exercise.name)
-            };
+            let sol_path = current_exercise.sol_path();
 
-            if Path::new(&solution_path).exists() {
-                return Ok(Some(solution_path));
+            if Path::new(&sol_path).exists() {
+                return Ok(Some(sol_path));
             }
 
             Ok(None)
         }
     }
 
+    // Return the exercise index of the first pending exercise found.
+    fn check_all_exercises(&self, stdout: &mut StdoutLock) -> Result<Option<usize>> {
+        stdout.write_all(RERUNNING_ALL_EXERCISES_MSG)?;
+        let n_exercises = self.exercises.len();
+
+        let status = thread::scope(|s| {
+            let handles = self
+                .exercises
+                .iter()
+                .map(|exercise| {
+                    thread::Builder::new()
+                        .spawn_scoped(s, || exercise.run_exercise(None, &self.cmd_runner))
+                })
+                .collect::<Vec<_>>();
+
+            for (exercise_ind, spawn_res) in handles.into_iter().enumerate() {
+                write!(stdout, "\rProgress: {exercise_ind}/{n_exercises}")?;
+                stdout.flush()?;
+
+                let Ok(handle) = spawn_res else {
+                    return Ok(AllExercisesCheck::CheckedUntil(exercise_ind));
+                };
+
+                let Ok(success) = handle.join().unwrap() else {
+                    return Ok(AllExercisesCheck::CheckedUntil(exercise_ind));
+                };
+
+                if !success {
+                    return Ok(AllExercisesCheck::Pending(exercise_ind));
+                }
+            }
+
+            Ok::<_, io::Error>(AllExercisesCheck::AllDone)
+        })?;
+
+        let mut exercise_ind = match status {
+            AllExercisesCheck::Pending(exercise_ind) => return Ok(Some(exercise_ind)),
+            AllExercisesCheck::AllDone => return Ok(None),
+            AllExercisesCheck::CheckedUntil(ind) => ind,
+        };
+
+        // We got an error while checking all exercises in parallel.
+        // This could be because we exceeded the limit of open file descriptors.
+        // Therefore, try to continue the check sequentially.
+        for exercise in &self.exercises[exercise_ind..] {
+            write!(stdout, "\rProgress: {exercise_ind}/{n_exercises}")?;
+            stdout.flush()?;
+
+            let success = exercise.run_exercise(None, &self.cmd_runner)?;
+            if !success {
+                return Ok(Some(exercise_ind));
+            }
+
+            exercise_ind += 1;
+        }
+
+        Ok(None)
+    }
+
     /// Mark the current exercise as done and move on to the next pending exercise if one exists.
     /// If all exercises are marked as done, run all of them to make sure that they are actually
     /// done. If an exercise which is marked as done fails, mark it as pending and continue on it.
-    pub fn done_current_exercise(&mut self, writer: &mut StdoutLock) -> Result<ExercisesProgress> {
+    pub fn done_current_exercise(&mut self, stdout: &mut StdoutLock) -> Result<ExercisesProgress> {
         let exercise = &mut self.exercises[self.current_exercise_ind];
         if !exercise.done {
             exercise.done = true;
@@ -373,62 +450,42 @@ impl AppState {
 
         if let Some(ind) = self.next_pending_exercise_ind() {
             self.set_current_exercise_ind(ind)?;
-
             return Ok(ExercisesProgress::NewPending);
         }
 
-        writer.write_all(RERUNNING_ALL_EXERCISES_MSG)?;
+        if let Some(pending_exercise_ind) = self.check_all_exercises(stdout)? {
+            stdout.write_all(b"\n\n")?;
 
-        let mut output = Vec::with_capacity(OUTPUT_CAPACITY);
-        for (exercise_ind, exercise) in self.exercises().iter().enumerate() {
-            write!(writer, "Running {exercise} ... ")?;
-            writer.flush()?;
-
-            let success = exercise.run_exercise(&mut output, &self.target_dir)?;
-            if !success {
-                writeln!(writer, "{}\n", "FAILED".red())?;
-
-                self.current_exercise_ind = exercise_ind;
-
-                // No check if the exercise is done before setting it to pending
-                // because no pending exercise was found.
-                self.exercises[exercise_ind].done = false;
-                self.n_done -= 1;
-
-                self.write()?;
-
-                return Ok(ExercisesProgress::NewPending);
-            }
-
-            writeln!(writer, "{}", "ok".green())?;
+            self.current_exercise_ind = pending_exercise_ind;
+            self.exercises[pending_exercise_ind].done = false;
+            // All exercises were marked as done.
+            self.n_done -= 1;
+            self.write()?;
+            return Ok(ExercisesProgress::NewPending);
         }
 
         // Write that the last exercise is done.
         self.write()?;
 
-        clear_terminal(writer)?;
-        writer.write_all(FENISH_LINE.as_bytes())?;
+        clear_terminal(stdout)?;
+        stdout.write_all(FENISH_LINE.as_bytes())?;
 
-        let final_message = self.final_message.trim();
+        let final_message = self.final_message.trim_ascii();
         if !final_message.is_empty() {
-            writer.write_all(final_message.as_bytes())?;
-            writer.write_all(b"\n")?;
+            stdout.write_all(final_message.as_bytes())?;
+            stdout.write_all(b"\n")?;
         }
 
         Ok(ExercisesProgress::AllDone)
     }
 }
 
-const CARGO_METADATA_ERR: &str = "Failed to run the command `cargo metadata …`
-Did you already install Rust?
-Try running `cargo --version` to diagnose the problem.";
-
+const BAD_INDEX_ERR: &str = "The current exercise index is higher than the number of exercises";
+const STATE_FILE_HEADER: &[u8] = b"DON'T EDIT THIS FILE!\n\n";
 const RERUNNING_ALL_EXERCISES_MSG: &[u8] = b"
 All exercises seem to be done.
 Recompiling and running all exercises to make sure that all of them are actually done.
-
 ";
-
 const FENISH_LINE: &str = "+----------------------------------------------------+
 |          You made it to the Fe-nish line!          |
 +--------------------------  ------------------------+
@@ -460,9 +517,10 @@ mod tests {
             dir: None,
             name: "0",
             path: "exercises/0.rs",
+            canonical_path: None,
             test: false,
             strict_clippy: false,
-            hint: String::new(),
+            hint: "",
             done: false,
         }
     }
@@ -474,9 +532,11 @@ mod tests {
             exercises: vec![dummy_exercise(), dummy_exercise(), dummy_exercise()],
             n_done: 0,
             final_message: String::new(),
+            state_file: tempfile::tempfile().unwrap(),
             file_buf: Vec::new(),
             official_exercises: true,
-            target_dir: PathBuf::new(),
+            cmd_runner: CmdRunner::build().unwrap(),
+            vs_code: false,
         };
 
         let mut assert = |done: [bool; 3], expected: [Option<usize>; 3]| {
