@@ -1,3 +1,93 @@
+<a name="6.4.0"></a>
+
+## 6.4.0 (2024-11-11)
+
+### Added
+
+- The list of exercises is now searchable by pressing `s` or `/` 🔍️ (thanks to [@frroossst](https://github.com/frroossst))
+- New option `c` in the prompt to manually check all exercises ✅ (thanks to [@Nahor](https://github.com/Nahor))
+- New command `check-all` to manually check all exercises ✅ (thanks to [@Nahor](https://github.com/Nahor))
+- Addictive animation for showing the progress of checking all exercises. A nice showcase of parallelism in Rust ✨
+- New option `x` in the prompt to reset the file of the current exercise 🔄
+- Allow `dead_code` for all exercises and solutions ⚰️ (thanks to [@huss4in](https://github.com/huss4in))
+- Pause input while running an exercise to avoid unexpected prompt interactions ⏸️
+- Limit the maximum number of exercises to 999. Any third-party exercises willing to reach that limit? 🔝
+
+### Changed
+
+- `enums3`: Remove redundant enum definition task (thanks to [@senekor](https://github.com/senekor))
+- `if2`: Make the exercise less confusing by avoiding "fizz", "fuzz", "foo", "bar" and "baz" (thanks to [@senekor](https://github.com/senekor))
+- `hashmap3`: Use the method `Entry::or_default`.
+- Update the state of all exercises when checking all of them (thanks to [@Nahor](https://github.com/Nahor))
+- The main prompt doesn't need a confirmation with ENTER on Unix-like systems anymore.
+- No more jumping back to a previous exercise when its file is changed. Use the list to jump between exercises.
+- Dump the solution file after an exercise is done even if the solution's directory doesn't exist.
+- Rework the footer in the list.
+- Optimize the file watcher.
+
+### Fixed
+
+- Fix bad contrast in the list on terminals with a light theme.
+
+<a name="6.3.0"></a>
+
+## 6.3.0 (2024-08-29)
+
+### Added
+
+- Add the following exercise lints:
+  - `forbid(unsafe_code)`: You shouldn't write unsafe code in Rustlings.
+  - `forbid(unstable_features)`: You don't need unstable features in Rustlings and shouldn't rely on them while learning Rust.
+  - `forbid(todo)`: You forgot a `todo!()`.
+  - `forbid(empty_loop)`: This can only happen by mistake in Rustlings.
+  - `deny(infinite_loop)`: No infinite loops are needed in Rustlings.
+  - `deny(mem_forget)`: You shouldn't leak memory while still learning Rust.
+- Show a link to every exercise file in the list.
+- Add scroll padding in the list.
+- Break the help footer of the list into two lines when the terminal width isn't big enough.
+- Enable scrolling with the mouse in the list.
+- `dev check`: Show the progress of checks.
+- `dev check`: Check that the length of all exercise names is lower than 32.
+- `dev check`: Check if exercise contains no tests and isn't marked with `test = false`.
+
+### Changed
+
+- The compilation time when installing Rustlings is reduced.
+- Pressing `c` in the list for "continue on" now quits the list after setting the selected exercise as the current one.
+- Better highlighting of the solution file after an exercise is done.
+- Don't show the output of successful tests anymore. Instead, show the pretty output for tests.
+- Be explicit about `q` only quitting the list and not the whole program in the list.
+- Be explicit about `r` only resetting one exercise (the selected one) in the list.
+- Ignore the standard output of `git init`.
+- `threads3`: Remove the queue length and improve tests.
+- `errors4`: Use match instead of a comparison chain in the solution.
+- `functions3`: Only take `u8` to avoid using a too high number of iterations by mistake.
+- `dev check`: Always check with strict Clippy (warnings to errors) when checking the solutions.
+
+### Fixed
+
+- Fix the error on some systems about too many open files during the final check of all exercises.
+- Fix the list when the terminal height is too low.
+- Restore the terminal after an error in the list.
+
+<a name="6.2.0"></a>
+
+## 6.2.0 (2024-08-09)
+
+### Added
+
+- Show a message before checking and running an exercise. This gives the user instant feedback and avoids confusion if the checks take too long.
+- Show a helpful error message when trying to install Rustlings with a Rust version lower than the minimum one that Rustlings supports.
+- Add a `README.md` file to the `solutions/` directory.
+- Allow initializing Rustlings in a Cargo workspace.
+- `dev check`: Check that all solutions are formatted with `rustfmt`.
+
+### Changed
+
+- Remove the state file and the solutions directory from the generated `.gitignore` file.
+- Run the final check of all exercises in parallel.
+- Small exercise improvements.
+
 <a name="6.1.0"></a>
 
 ## 6.1.0 (2024-07-10)
@@ -54,7 +144,7 @@ You can read about the motivations of this change in [this issue](https://github
 
 ### List mode
 
-A list mode was added using [Ratatui](https://ratatui.rs).
+A new list mode was added!
 You can enter it by entering `l` in the watch mode.
 It offers the following features:
 
@@ -755,7 +845,7 @@ Then follow the link to the guide about [third-party exercises](THIRD_PARTY_EXER
 
 #### Bug Fixes
 
-- Update deps to version compatable with aarch64-pc-windows (#263) ([19a93428](https://github.com/rust-lang/rustlings/commit/19a93428b3c73d994292671f829bdc8e5b7b3401))
+- Update deps to version compatible with aarch64-pc-windows (#263) ([19a93428](https://github.com/rust-lang/rustlings/commit/19a93428b3c73d994292671f829bdc8e5b7b3401))
 - **docs:**
   - Added a necessary step to Windows installation process (#242) ([3906efcd](https://github.com/rust-lang/rustlings/commit/3906efcd52a004047b460ed548037093de3f523f))
   - Fixed mangled sentence from book; edited for clarity (#266) ([ade52ff](https://github.com/rust-lang/rustlings/commit/ade52ffb739987287ddd5705944c8777705faed9))
