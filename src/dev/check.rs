@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Error, Result};
 use std::{
     cmp::Ordering,
+    collections::HashSet,
     fs::{self, read_dir, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -11,12 +12,12 @@ use std::{
 use crate::{
     cargo_toml::{append_bins, bins_start_end_ind, BINS_BUFFER_CAPACITY},
     cmd::CmdRunner,
-    collections::{hash_set_with_capacity, HashSet},
     exercise::{RunnableExercise, OUTPUT_CAPACITY},
     info_file::{ExerciseInfo, InfoFile},
     CURRENT_FORMAT_VERSION,
 };
 
+const MAX_N_EXERCISES: usize = 999;
 const MAX_EXERCISE_NAME_LEN: usize = 32;
 
 // Find a char that isn't allowed in the exercise's `name` or `dir`.
@@ -52,8 +53,8 @@ fn check_cargo_toml(
 
 // Check the info of all exercises and return their paths in a set.
 fn check_info_file_exercises(info_file: &InfoFile) -> Result<HashSet<PathBuf>> {
-    let mut names = hash_set_with_capacity(info_file.exercises.len());
-    let mut paths = hash_set_with_capacity(info_file.exercises.len());
+    let mut names = HashSet::with_capacity(info_file.exercises.len());
+    let mut paths = HashSet::with_capacity(info_file.exercises.len());
 
     let mut file_buf = String::with_capacity(1 << 14);
     for exercise_info in &info_file.exercises {
@@ -201,7 +202,7 @@ fn check_exercises_unsolved(
 
     for (exercise_name, handle) in handles {
         let Ok(result) = handle.join() else {
-            bail!("Panic while trying to run the exericse {exercise_name}");
+            bail!("Panic while trying to run the exercise {exercise_name}");
         };
 
         match result {
@@ -281,7 +282,7 @@ fn check_solutions(
         .collect::<Result<Vec<_>, _>>()
         .context("Failed to spawn a thread to check a solution")?;
 
-    let mut sol_paths = hash_set_with_capacity(info_file.exercises.len());
+    let mut sol_paths = HashSet::with_capacity(info_file.exercises.len());
     let mut fmt_cmd = Command::new("rustfmt");
     fmt_cmd
         .arg("--check")
@@ -299,7 +300,7 @@ fn check_solutions(
     for (exercise_info, handle) in info_file.exercises.iter().zip(handles) {
         let Ok(check_result) = handle.join() else {
             bail!(
-                "Panic while trying to run the solution of the exericse {}",
+                "Panic while trying to run the solution of the exercise {}",
                 exercise_info.name,
             );
         };
@@ -346,6 +347,10 @@ fn check_solutions(
 
 pub fn check(require_solutions: bool) -> Result<()> {
     let info_file = InfoFile::parse()?;
+
+    if info_file.exercises.len() > MAX_N_EXERCISES {
+        bail!("The maximum number of exercises is {MAX_N_EXERCISES}");
+    }
 
     if cfg!(debug_assertions) {
         // A hack to make `cargo run -- dev check` work when developing Rustlings.
